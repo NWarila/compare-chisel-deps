@@ -152,37 +152,84 @@ parse_args() {
   log INFO "Settings: RELEASE_OVERRIDE='${RELEASE_OVERRIDE:-<auto>}', DRY_RUN=${DRY_RUN}, PACKAGES=(${PACKAGES[*]})"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ensure_prereqs
-#   Installs apt-rdepends, curl, jq if missing. Respects DRY_RUN.
-# ──────────────────────────────────────────────────────────────────────────────
-ensure_prereqs() {
-  local missing=()
-  for tool in apt-rdepends curl jq; do
-    command -v "$tool" &>/dev/null || missing+=("$tool")
-  done
+###############################################################################
+### check_prereqs
+### Purpose   : Ensure host environment is safe before heavy logic runs.
+### Inputs    : env LC_ALL / LANG, CHISEL_OFFLINE, CHISEL_PING_TIMEOUT
+### Outputs   : writes diagnostics to stderr
+### Side-fx   : creates & cleans a secure temp file
+### Exit-codes: 2 = unmet prerequisite
+###############################################################################
+check_prereqs() {
+  # Enforce strict-mode even if caller forgot
+  [[ $- == *e* && $- == *u* ]] || set -euo pipefail
 
-  if (( ${#missing[@]} == 0 )); then
-    log INFO "All prerequisites installed."
-    return
+  local bash_ver chisel_ver chisel_major os_id tmpf
+  # shellcheck disable=SC2155
+  local prev_ret=$(trap -p RETURN | cut -d"'" -f2 || true)
+
+  # 1. Bash ≥ 4.0
+  bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  (( BASH_VERSINFO[0] >= 4 )) || { log_err "Need Bash ≥4 (got $bash_ver)"; exit 2; }
+
+  # 2. pipefail active
+  [[ $(set -o | awk '$1=="pipefail"{print $2}') == on ]] ||
+    { log_err "\"set -o pipefail\" inactive – invoked via sh?"; exit 2; }
+
+  # 3. non-root
+  [[ $EUID -ne 0 ]] || { log_err "Run as non-root; sudo not required."; exit 2; }
+
+  # 4. required tools
+  command -v apt-cache >/dev/null || { log_err "\"apt-cache\" missing"; exit 2; }
+  command -v chisel     >/dev/null || { log_err "\"chisel\" CLI missing"; exit 2; }
+
+  # 5. chisel ≥1
+  chisel_ver=$(chisel --version 2>/dev/null | { read -r _ v; printf '%s\n' "${v#v}"; })
+  IFS=. read -r chisel_major _ <<<"$chisel_ver"
+  [[ ${chisel_major:-0} =~ ^[0-9]+$ && chisel_major -ge 1 ]] ||
+    { log_err "Require chisel ≥1.0 (got ${chisel_ver:-unknown})"; exit 2; }
+
+  # 6. Ubuntu/Debian host (case-insensitive) & safe perms
+  if [[ -r /etc/os-release ]]; then
+    if command -v stat >/dev/null 2>&1; then
+      # GNU = -c, BSD = -f
+      local perms
+      perms=$(stat -Lc '%u:%a' /etc/os-release 2>/dev/null ||
+              stat -f '%u:%Lp' /etc/os-release)
+      [[ $perms == 0:6* ]] || { log_err "/etc/os-release perms unsafe"; exit 2; }
+    fi
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    # shellcheck disable=SC2076
+    [[ "${ID,,}" =~ ^(ubuntu|debian)$ ]] ||
+      { log_err "Unsupported OS \"$ID\" – need Ubuntu/Debian"; exit 2; }
+  else
+    log_err "Cannot read /etc/os-release"; exit 2
   fi
 
-  log WARN "Missing prerequisites: ${missing[*]}"
-  if [[ $DRY_RUN == true ]]; then
-    log INFO "[dry-run] Would install: ${missing[*]}"
-    return
+  # 7. grep features
+  echo a | grep -Eq '^[[:alpha:]]' ||
+    { log_err "\"grep\" lacks -E or POSIX classes"; exit 2; }
+
+  # 8. secure tmp with trap chain
+  umask 077
+  tmpf=$(mktemp -t prereq.XXXXXX) || { log_err "mktemp failed"; exit 2; }
+  trap "${prev_ret:+$prev_ret; }rm -f \"$tmpf\"" RETURN
+
+  # 9. optional chisel ping
+  if [[ -z ${CHISEL_OFFLINE:-} ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "${CHISEL_PING_TIMEOUT:-1}" chisel releases list >/dev/null 2>&1 ||
+        log_warn "chisel releases list unreachable – offline?"
+    else
+      log_warn "\"timeout\" absent; skipping network probe"
+    fi
   fi
 
-  local sudo_cmd=""
-  (( EUID != 0 )) && {
-    command -v sudo &>/dev/null || { log ERROR "sudo required but not found."; exit 3; }
-    sudo_cmd="sudo"
-  }
-
-  log INFO "Installing prerequisites: ${missing[*]}"
-  DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get install -y "${missing[@]}"
-  log INFO "Prerequisites installation complete."
+  # 10. locale advisory
+  local locale_val=${LC_ALL:-${LANG:-C}}
+  [[ $locale_val =~ ^(C|POSIX)$ ]] ||
+    log_warn "Consider LC_ALL=C for stable diagnostics"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

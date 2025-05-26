@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
-# compare_chisel_deps.sh – compare an app’s apt deps vs. Ubuntu Chiseled slices
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Strict mode & safe IFS
-# ──────────────────────────────────────────────────────────────────────────────
+###############################################################################
+#  compare_chisel_deps.sh – compare apt runtime deps with Ubuntu-Chisel slices
+#  Version 1.1.0
+###############################################################################
 set -euo pipefail
 IFS=$'\n\t'
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Globals
-# ──────────────────────────────────────────────────────────────────────────────
-SCRIPT_NAME="$(basename "$0")"
-VERSION="1.0.0"
-LOGFILE="/var/log/compare_chisel_deps.log"
-
-RELEASE_OVERRIDE=""        # can be set via -r/--release
-DRY_RUN=false              # toggled via -n/--dry-run
-declare -a PACKAGES=()     # populated by parse_args()
+# ──────────────────────────── configurable paths ─────────────────────────────
+SCRIPT_NAME=${0##*/}
+VERSION="1.1.0"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/compare_chisel_deps"
+mkdir -p "$STATE_DIR"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # usage [exit_code]
@@ -43,81 +37,141 @@ usage() {
   # shellcheck disable=SC2155
   local vmsg=${VERSION:+ Version ${VERSION}}
 
-  printf '%s\n' \
-"Usage: ${SCRIPT_NAME} [OPTIONS] <package> [<package>...]
+  cat <<EOF
+Usage: ${SCRIPT_NAME} [OPTIONS] <package> [<package>...]
 Compare an application's apt dependencies against Ubuntu Chiseled slices.
 
 Options:
-  -r, --release VERSION   Target Ubuntu version (format XX.XX).
-                          Defaults to auto-detect from /etc/os-release.
-  -n, --dry-run           Print actions only; do not install tools or write files.
+  -r, --release VERSION   Ubuntu version (format XX.XX). Default: auto-detect.
+  -n, --dry-run           Print actions only; do not install tools or write
+                          files or download packages.
   -v, --version           Show script version and exit.
   -h, --help              Show this help text and exit.
 
 Examples:
-  \"${SCRIPT_NAME}\" wordpress
-  \"${SCRIPT_NAME}\" -r 25.04 wordpress php-fpm mariadb-server
-  \"${SCRIPT_NAME}\" --dry-run wordpress
+  ${SCRIPT_NAME} wordpress
+  ${SCRIPT_NAME} -r 25.04 wordpress php-fpm mariadb-server
+  ${SCRIPT_NAME} --dry-run curl
 
-${vmsg}"
+${vmsg}
+EOF
+
   # return when sourced, otherwise exit
   return "$exit_code" 2>/dev/null || exit "$exit_code"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# log LEVEL MESSAGE…
-#   Single function: lazy-inits log file, pads fields, and prints aligned lines.
-#   LEVEL must be one of DEBUG, INFO, WARN, ERROR.
-# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# log LEVEL MESSAGE...
+# Logs a message at the given LEVEL (DEBUG, INFO, WARN, or ERROR).
+# On first use, initializes the log file and configuration.
+#
+# Log file: $LOGFILE (auto-set to XDG state dir or /tmp on first call if unset)
+# Console output: Colored by level (red=ERROR, yellow=WARN, cyan=INFO; DEBUG uncolored),
+#                 suppressed if $NO_COLOR is set (follows NO_COLOR standard:contentReference[oaicite:2]{index=2}).
+# Console verbosity: Controlled by $LOG_LEVEL (DEBUG, INFO, WARN, ERROR).
+#                   - Default: INFO (shows INFO, WARN, ERROR; hides DEBUG)
+#                   - LOG_LEVEL=DEBUG or --verbose: show all levels (including DEBUG)
+#                   - LOG_LEVEL=ERROR or --quiet: show only errors (hide INFO/WARN)
+#
+# The log file always receives all messages (regardless of console level), with timestamp,
+# script name & PID, level, and message. File is opened append-only (FD 3) for efficiency.
+# ─────────────────────────────────────────────────────────────────────────────
 log() {
-  local level=$1; shift
+  local level="$1"; shift
   local msg="$*"
 
+  # Initialize logging on first call
   if [[ -z ${__LOG_INIT+x} ]]; then
-    __LOG_INIT=1
+    __LOG_INIT=1   # mark initialized
 
-    # 1) Prepare log file
-    mkdir -p "$(dirname "$LOGFILE")"
+    # Determine log file path (use XDG_STATE_HOME or ~/.local/state, else /tmp)
+    local script="${0##*/}"
+    local base_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
+    [[ -z "$base_dir" ]] && base_dir="/tmp"    # fallback to /tmp if no home directory
+    LOGFILE="${LOGFILE:-$base_dir/$script/$script.log}"  # default log file path
+    if ! mkdir -p "$(dirname "$LOGFILE")"; then
+      # If state dir not writable, use /tmp as last resort
+      LOGFILE="/tmp/${script}.log"
+      mkdir -p "/tmp" 2>/dev/null
+    fi
+
+    # Create/truncate log file and set secure permissions (only user can read/write)
     : > "$LOGFILE"
+    chmod 600 "$LOGFILE" 2>/dev/null || true
 
-    # 2) Compute static SCRIPT:PID field (14-char name + : + 4-digit PID, padded to 20)
-    local script pid
-    script="$(basename "$0")"
-    printf -v script '%-14.14s' "$script"
+    # Prepare fixed-width script:PID field for log entries (14-char name + 4-digit PID)
+    local pid
+    printf -v __LOG_SCRIPT_NAME '%-14.14s' "$script"
     printf -v pid '%04d' "$$"
-    printf -v __LOG_SCRIPT_PID_FIELD '%-20s' "${script}:${pid}"
+    printf -v __LOG_SCRIPT_PID_FIELD '%-20s' "${__LOG_SCRIPT_NAME}:${pid}"
 
-    # 3) Pre-pad levels to 5 chars
-    declare -gA __LOG_PAD_LEVEL=(
-      [DEBUG]="DEBUG"
-      [INFO ]="INFO "
-      [WARN ]="WARN "
-      [ERROR]="ERROR"
-    )
+    # Predefine padded level strings (for alignment)
+    declare -gA __LOG_PAD_LEVEL=([DEBUG]="DEBUG" [INFO]="INFO" [WARN]="WARN" [ERROR]="ERROR")
 
-    # 4) Open logfile once on FD 3
+    # Set up color codes (ANSI escapes) for console, unless NO_COLOR is set:contentReference[oaicite:3]{index=3}
+    if [[ -z ${NO_COLOR+x} ]]; then
+      __LOG_RED=$'\e[31m'; __LOG_YEL=$'\e[33m'; __LOG_CYN=$'\e[36m'; __LOG_MAG=$'\e[35m'; __LOG_RST=$'\e[0m'
+    else
+      __LOG_RED=""; __LOG_YEL=""; __LOG_CYN=""; __LOG_MAG=""; __LOG_RST=""
+    fi
+
+    # Map log levels to numeric severity for comparison (DEBUG=0, INFO=1, WARN=2, ERROR=3)
+    declare -gA __LOG_LEVEL_VALUES=([DEBUG]=0 [INFO]=1 [WARN]=2 [ERROR]=3)
+
+    # Open log file on FD 3 for efficient appending (use exec to keep it open)
     exec 3>>"$LOGFILE"
   fi
 
-  # a) Timestamp (builtin, no external date)
-  local ts lvl line
-  printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' -1
-
-  # b) Lookup padded level (or pad/truncate unknown ones)
-  lvl="${__LOG_PAD_LEVEL[$level]:-}"
-  if [[ -z $lvl ]]; then
-    printf -v lvl '%-5.5s' "$level"
+  # Format current timestamp in UTC ISO8601 (YYYY-MM-DDTHH:MM:SSZ)
+  local ts
+  if ! printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' -1 2>/dev/null; then
+    # Fallback to external date if built-in fails (for older Bash)
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
 
-  # c) Compose, write to log, and echo to console
-  line="[$ts] [${__LOG_SCRIPT_PID_FIELD}] [${lvl}] ${msg}"
-  printf '%s\n' "$line" >&3
-  if [[ $level == "WARN" || $level == "ERROR" ]]; then
-    printf '%s\n' "$line" >&2
-  else
-    printf '%s\n' "$line"
+  # Ensure level tag is padded to 5 characters (or truncate if longer)
+  local lvl="${__LOG_PAD_LEVEL[$level]:-}"
+  [[ -z "$lvl" ]] && printf -v lvl '%-5.5s' "$level"
+
+  # Compose the log line
+  local line="[$ts] [${__LOG_SCRIPT_PID_FIELD}] [${lvl}] ${msg}"
+
+  # Write to log file (always append). If FD 3 is unavailable (should not happen after init),
+  # fall back to direct append.
+  printf '%s\n' "$line" >&3 2>/dev/null || printf '%s\n' "$line" >> "$LOGFILE"
+
+  # Determine numeric severity of this message and current console threshold
+  local sev="${__LOG_LEVEL_VALUES[$level]:-1}"
+  local threshold="${__LOG_LEVEL_VALUES[${LOG_LEVEL:-INFO}]:-1}"
+  [[ -z "$sev" ]] && sev=1         # treat unknown levels as INFO
+  [[ -z "$threshold" ]] && threshold=1
+
+  # Echo to console if message severity is >= current $LOG_LEVEL severity
+  if (( sev >= threshold )); then
+    local color=""
+    if [[ -z ${NO_COLOR+x} ]]; then
+      case "$level" in
+        DEBUG) color="$__LOG_MAG" ;;
+        INFO)  color="$__LOG_CYN" ;;
+        WARN)  color="$__LOG_YEL" ;;
+        ERROR) color="$__LOG_RED" ;;
+      esac
+    fi
+    # Print to stderr for WARN/ERROR, stdout otherwise, with color reset after each line
+    if [[ "$level" == "WARN" || "$level" == "ERROR" ]]; then
+      printf '%s\n' "${color}${line}${__LOG_RST}" >&2
+    else
+      printf '%s\n' "${color}${line}${__LOG_RST}"
+    fi
   fi
 }
+
+# Convenience wrapper functions for each log level:
+log_debug() { log "DEBUG" "$@"; }
+log_info()  { log "INFO"  "$@"; }
+log_warn()  { log "WARN"  "$@"; }
+log_err()   { log "ERROR" "$@"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # parse_args
@@ -133,15 +187,15 @@ log() {
 ###   3  GNU getopt missing.
 # ──────────────────────────────────────────────────────────────────────────────
 parse_args() {
-  # Ensure GNU getopt exists (macOS users: `brew install gnu-getopt`)
+  ALLOW_ROOT=0  # default: block root unless overridden
+
   if ! command -v getopt >/dev/null 2>&1; then
     log_err "GNU getopt is required for argument parsing."
     return 3
   fi
 
-  # shellcheck disable=SC2155
   local _opts
-  if ! _opts=$(getopt -o r:nvh -l release:,dry-run,version,help -n "$SCRIPT_NAME" -- "$@"); then
+  if ! _opts=$(getopt -o r:nvh -l release:,dry-run,version,help,allow-root -n "$SCRIPT_NAME" -- "$@"); then
     usage 2; return 2
   fi
   eval set -- "$_opts"
@@ -149,19 +203,13 @@ parse_args() {
   local release_override='' dry_run=false
   while true; do
     case "$1" in
-      -r|--release)
-        release_override=$2
-        # shellcheck disable=SC2076 # intentional regex
-        if [[ ! "$release_override" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
-          log_err "Invalid release format: '$release_override' (expected XX.XX)"
-          usage 2; return 2
-        fi
-        shift 2 ;;
-      -n|--dry-run) dry_run=true; shift ;;
-      -v|--version) printf '%s %s\n' "$SCRIPT_NAME" "${VERSION:-unknown}"; return 0 ;;
-      -h|--help)    usage 0; return 0 ;;
-      --) shift; break ;;
-      *)  usage 2; return 2 ;;
+      -r|--release)    release_override=$2; shift 2 ;;
+      -n|--dry-run)    dry_run=true; shift ;;
+      -v|--version)    printf '%s %s\n' "$SCRIPT_NAME" "${VERSION:-unknown}"; return 0 ;;
+      -h|--help)       usage 0; return 0 ;;
+      --allow-root)    ALLOW_ROOT=1; shift ;;
+      --)              shift; break ;;
+      *)               usage 2; return 2 ;;
     esac
   done
 
@@ -171,15 +219,12 @@ parse_args() {
     usage 1; return 1
   fi
 
-  # Promote validated locals to globals
   RELEASE_OVERRIDE=$release_override
   DRY_RUN=$dry_run
 
-  # Quote array for log
-  log_info "Settings: RELEASE='${RELEASE_OVERRIDE:-<auto>}' DRY_RUN=$DRY_RUN PACKAGES=${PACKAGES[*]}"
+  log_info "Settings: RELEASE='${RELEASE_OVERRIDE:-<auto>}' DRY_RUN=$DRY_RUN ALLOW_ROOT=$ALLOW_ROOT PACKAGES=${PACKAGES[*]}"
   return 0
 }
-
 
 ###############################################################################
 ### check_prereqs
@@ -189,76 +234,99 @@ parse_args() {
 ### Side-fx   : creates & cleans a secure temp file
 ### Exit-codes: 2 = unmet prerequisite
 ###############################################################################
+###############################################################################
+### check_prereqs
+### Verify host environment before any heavy work.
+### Exits 2 on unrecoverable problems, otherwise 0.
+###############################################################################
 check_prereqs() {
-  # Enforce strict-mode even if caller forgot
-  [[ $- == *e* && $- == *u* ]] || set -euo pipefail
 
-  local bash_ver chisel_ver chisel_major os_id tmpf
-  # shellcheck disable=SC2155
-  local prev_ret=$(trap -p RETURN | cut -d"'" -f2 || true)
+  # ── 1. Bash & strict-mode --------------------------------------------------
+  local bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  (( BASH_VERSINFO[0] >= 4 )) || {
+    log_err "Bash ≥ 4.0 required (found ${bash_ver})"; exit 2; }
+  [[ $(set -o | awk '$1=="pipefail"{print $2}') == on ]] || {
+    log_err "\"set -o pipefail\" not active – invoked via /bin/sh?"; exit 2; }
 
-  # 1. Bash ≥ 4.0
-  bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
-  (( BASH_VERSINFO[0] >= 4 )) || { log_err "Need Bash ≥4 (got $bash_ver)"; exit 2; }
-
-  # 2. pipefail active
-  [[ $(set -o | awk '$1=="pipefail"{print $2}') == on ]] ||
-    { log_err "\"set -o pipefail\" inactive – invoked via sh?"; exit 2; }
-
-  # 3. non-root
-  [[ $EUID -ne 0 ]] || { log_err "Run as non-root; sudo not required."; exit 2; }
-
-  # 4. required tools
-  command -v apt-cache >/dev/null || { log_err "\"apt-cache\" missing"; exit 2; }
-  command -v chisel     >/dev/null || { log_err "\"chisel\" CLI missing"; exit 2; }
-
-  # 5. chisel ≥1
-  chisel_ver=$(chisel --version 2>/dev/null | { read -r _ v; printf '%s\n' "${v#v}"; })
-  IFS=. read -r chisel_major _ <<<"$chisel_ver"
-  [[ ${chisel_major:-0} =~ ^[0-9]+$ && chisel_major -ge 1 ]] ||
-    { log_err "Require chisel ≥1.0 (got ${chisel_ver:-unknown})"; exit 2; }
-
-  # 6. Ubuntu/Debian host (case-insensitive) & safe perms
-  if [[ -r /etc/os-release ]]; then
-    if command -v stat >/dev/null 2>&1; then
-      # GNU = -c, BSD = -f
-      local perms
-      perms=$(stat -Lc '%u:%a' /etc/os-release 2>/dev/null ||
-              stat -f '%u:%Lp' /etc/os-release)
-      [[ $perms == 0:6* ]] || { log_err "/etc/os-release perms unsafe"; exit 2; }
-    fi
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    # shellcheck disable=SC2076
-    [[ "${ID,,}" =~ ^(ubuntu|debian)$ ]] ||
-      { log_err "Unsupported OS \"$ID\" – need Ubuntu/Debian"; exit 2; }
-  else
-    log_err "Cannot read /etc/os-release"; exit 2
-  fi
-
-  # 7. grep features
-  echo a | grep -Eq '^[[:alpha:]]' ||
-    { log_err "\"grep\" lacks -E or POSIX classes"; exit 2; }
-
-  # 8. secure tmp with trap chain
-  umask 077
-  tmpf=$(mktemp -t prereq.XXXXXX) || { log_err "mktemp failed"; exit 2; }
-  trap "${prev_ret:+$prev_ret; }rm -f \"$tmpf\"" RETURN
-
-  # 9. optional chisel ping
-  if [[ -z ${CHISEL_OFFLINE:-} ]]; then
-    if command -v timeout >/dev/null 2>&1; then
-      timeout "${CHISEL_PING_TIMEOUT:-1}" chisel releases list >/dev/null 2>&1 ||
-        log_warn "chisel releases list unreachable – offline?"
+  # ── 2. Least-privilege (unless --allow-root) ------------------------------
+  if [[ $EUID -eq 0 ]]; then
+    if [[ ${ALLOW_ROOT:-0} -eq 1 ]]; then
+      log_warn "Running as root is discouraged, but continuing due to --allow-root."
     else
-      log_warn "\"timeout\" absent; skipping network probe"
+      log_err "Run as non-root; use --allow-root to override."
+      exit 2
     fi
   fi
 
-  # 10. locale advisory
-  local locale_val=${LC_ALL:-${LANG:-C}}
-  [[ $locale_val =~ ^(C|POSIX)$ ]] ||
-    log_warn "Consider LC_ALL=C for stable diagnostics"
+  # ── 3. Core CLI tools ------------------------------------------------------
+  for t in apt-cache apt-rdepends curl jq apt-file; do
+    command -v "$t" >/dev/null 2>&1 || {
+      log_err "\"$t\" command not found. Install: sudo apt install $t"
+      exit 2
+    }
+  done
+
+  # ── 3a. APT package lists exist (handle .lz4, .gz, etc.) ------------------
+  local list_count
+  list_count=$(
+    find /var/lib/apt/lists -maxdepth 1 -type f \
+         ! -name 'lock' ! -path '*/partial/*' -print 2>/dev/null | wc -l
+  )
+  if (( list_count == 0 )); then
+    log_err "APT index cache empty (found 0 files) – run: sudo apt-get update"
+    exit 2
+  fi
+  log_debug "APT list files detected: ${list_count}"
+
+  # ── 3b. apt-file cache (Contents index) present ---------------------------
+  local apt_file_msg
+  if ! apt_file_msg=$(apt-file --non-interactive list bash 2>&1 >/dev/null); then
+    if grep -qi "cache is empty" <<<"$apt_file_msg"; then
+      if [[ $EUID -eq 0 && ${ALLOW_ROOT:-0} -eq 1 ]]; then
+        log_warn "apt-file cache empty, running 'apt-file update' automatically"
+        if ! apt-file --non-interactive update >/dev/null 2>&1; then
+          log_err "'apt-file update' failed – check network/repo"
+          exit 2
+        fi
+      else
+        log_err "apt-file cache empty – run: sudo apt-file update"
+        exit 2
+      fi
+    fi
+  fi
+
+  # ── 3c. Sanity: apt-get can resolve a package -----------------------------
+  if ! LC_ALL=C apt-get -qq download bash >/dev/null 2>&1; then
+    log_err "APT cannot download packages – check network / sources"
+    exit 2
+  fi
+
+  # ── 4. Supported distro (Ubuntu/Debian) -----------------------------------
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ ${ID,,} =~ ^(ubuntu|debian)$ ]] || {
+      log_err "Unsupported OS \"$ID\" — Debian/Ubuntu required"; exit 2; }
+  else
+    log_err "Cannot read /etc/os-release to determine OS"; exit 2
+  fi
+
+  # ── 5. grep supports –E & POSIX classes -----------------------------------
+  echo a | grep -Eq '^[[:alpha:]]' || {
+    log_err "\"grep\" lacks -E or POSIX character-class support"; exit 2; }
+
+  # ── 6. Secure temp-file creation ------------------------------------------
+  umask 077
+  if ! tmpf=$(mktemp -t prereq.XXXXXX 2>/dev/null); then
+    log_err "mktemp failed — cannot create secure temp file"; exit 2
+  fi
+  rm -f "$tmpf"
+
+  # ── 7. Locale advice (non-fatal) ------------------------------------------
+  [[ ${LC_ALL:-} =~ ^(C|POSIX)$ ]] || \
+    log_warn "Consider LC_ALL=C for predictable diagnostics"
+
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -269,10 +337,10 @@ validate_packages() {
   for pkg in "${PACKAGES[@]}"; do
     # suppress locale warnings
     if ! LC_ALL=C apt-cache show "$pkg" &>/dev/null; then
-      log "ERROR" "Package not found in APT repositories: '$pkg'"
+      log_err "Package not found in APT repositories: '$pkg'"
       exit 1
     else
-      log "INFO" "Verified package exists: $pkg"
+      log_info "Verified package exists: $pkg"
     fi
   done
 }
@@ -325,6 +393,11 @@ get_available_slices() {
   local version branch etag_file api_url http raw
   local -a names
 
+  if [[ ${DRY_RUN:-false} == true ]]; then
+    log_info "[DRY-RUN] Would query $api_url"
+    return 0
+  fi
+
   # ---- determine release ----------------------------------------------------
   if [[ -n ${RELEASE_OVERRIDE:-} ]]; then
     version=$RELEASE_OVERRIDE
@@ -360,6 +433,7 @@ get_available_slices() {
   case $http in
     200)
       printf '%s\n' "$(grep -Fi ETag -m1 < <(curl -I -s "$api_url") | awk '{print $2}')" >"$etag_file" 2>/dev/null || true
+      printf '%s\n' "$raw" >"${etag_file}.cache"
       ;;
     304) log_info "ETag match – using cached slice list"; raw=$(cat "$etag_file.cache");;
     404) log_err "Branch ${branch} not found (404)"; return 4 ;;
@@ -379,76 +453,80 @@ get_available_slices() {
   return 0
 }
 
-# ────────────────────────────────────────────────────────────────
-# get_file_count <package>
-#   Downloads the .deb for <package>, counts its file entries,
-#   then cleans up. Prints just the number.
-# ────────────────────────────────────────────────────────────────
+###############################################################################
 ### get_file_count
-### Count files contained in a Debian package (or its provider).
-### Globals  : log_err log_warn log_info helpers
-### Args     : $1 – package name (string, required)
-### Outputs  : file count to stdout
-### Exits    : 0 success
-###            1 usage error
-###            2 non-Debian host or missing tools
-###            3 download failed & no provider
-###            4 corrupt deb or zero files
+### Return the number of files contained in the binary package corresponding
+### to $1.  Fast-path uses `apt-file list`, falling back to downloading the
+### `.deb` and running `dpkg-deb -c` when apt-file draws a blank (e.g. virtual
+### packages).  If both paths fail, prints "err" and returns 4.
+###
+### Globals read : DRY_RUN, LOG_LEVEL
+### Globals used : log_*
+### Returns      : 0 on success, >0 on failure
+### Output       : file-count (integer) or "err" on stdout
+###############################################################################
 get_file_count() {
-  local -r pkg=$1
-  [[ -n $pkg ]] || { log_err "Usage: get_file_count <package>"; echo 0; return 1; }
+  local pkg=$1
+  [[ -n $pkg ]] || { log_err "get_file_count: package name required"; echo "err"; return 2; }
 
-  # Debian/Ubuntu-specific tools
-  for t in apt-get dpkg-deb; do
-    command -v "$t" >/dev/null || { log_err "$t not found"; echo 0; return 2; }
-  done
-
-  # Fast path: apt-file
-  if command -v apt-file >/dev/null 2>&1; then
-    local count
-    count=$(apt-file list "$pkg" 2>/dev/null | wc -l || true)
-    log_info "File count for $pkg via apt-file: $count"
-    printf '%s\n' "${count:-0}"
-    return 0
+  # Dry-run short-circuit
+  if [[ ${DRY_RUN:-false} == true ]]; then
+    log_info "[DRY-RUN] skip file-count for $pkg"
+    echo "0"; return 0
   fi
 
-  # Slow path: download .deb
-  umask 077
-  local tmpdir
-  tmpdir=$(mktemp -d) || { log_err "mktemp failed"; echo 0; return 2; }
+  # fast path via apt-file
+  if apt_file_out=$(apt-file --non-interactive list "$pkg" 2>/dev/null); then
+    local c; c=$(wc -l <<<"$apt_file_out")
+    (( c > 0 )) && { echo "$c"; return 0; }
+  fi
 
-  # Ensure cleanup even on error
+  # slow path: download .deb
+  local tmpdir
+  tmpdir=$(mktemp -d) || { log_err "mktemp failed"; echo "err"; return 3; }
+  chmod 0755 "$tmpdir"              # allow _apt sandbox to write here
+  mkdir -p "$tmpdir/partial"        # apt may need it
   trap 'rm -rf "$tmpdir"' RETURN
 
-  (
-    cd "$tmpdir" || exit 1
+  _get_deb() {
+    if apt-get help | grep -q "^\\s*download "; then
+      (cd "$tmpdir" && apt-get -qq download "$1")
+    else
+      LC_ALL=C apt-get -qq --download-only --reinstall \
+        -o Dir::Cache="$tmpdir" \
+        -o Dir::Cache::archives="$tmpdir/" \
+        install -- "$1"
+    fi
+  }
 
-    LC_ALL=C apt-get -qq download -- "$pkg" || {
-      log_warn "Download failed for '$pkg' – trying provider"
-      local provider
-      provider=$(apt-cache showpkg "$pkg" |
-                   awk '/Reverse Provides:/{f=1;next}f && NF{print $1; exit}')
-      [[ -n $provider ]] || { log_err "No provider for $pkg"; echo 0; exit 3; }
-      log_info "Falling back to provider '$provider'"
-      LC_ALL=C apt-get -qq download -- "$provider" || { echo 0; exit 3; }
-    }
+  if ! _get_deb "$pkg" 2>"$tmpdir/apt_err"; then
+    if grep -q "no candidate" "$tmpdir/apt_err"; then
+      log_warn "'$pkg' is virtual – count set to 0"
+      echo "0"; return 0
+    fi
+    mapfile -t providers < <(apt-cache showpkg "$pkg" |
+      awk '/Reverse Provides:/,/^$/' | tail -n +2 | awk '{print $1}')
+    if (( ${#providers[@]} )); then
+      pkg=${providers[0]}
+      log_info "Provider fallback '$pkg'"
+      _get_deb "$pkg" 2>>"$tmpdir/apt_err" || {
+        log_warn "Download failed: $(head -1 "$tmpdir/apt_err")"
+        echo "err"; return 4; }
+    else
+      log_warn "Download failed: $(head -1 "$tmpdir/apt_err")"
+      echo "err"; return 4
+    fi
+  fi
 
-    shopt -s nullglob
-    local debs=( *.deb )
-    shopt -u nullglob
-    (( ${#debs[@]} )) || { log_err "No .deb found for $pkg"; echo 0; exit 4; }
+  shopt -s nullglob
+  local debs=( "$tmpdir"/*.deb )
+  shopt -u nullglob
+  (( ${#debs[@]} )) || { log_warn "No .deb for '$pkg'"; echo "err"; return 4; }
 
-    local count
-    count=$(dpkg-deb -c "${debs[0]}" | wc -l || true)
-    [[ $count =~ ^[0-9]+$ && $count -gt 0 ]] || { log_err "Corrupt deb for $pkg"; echo 0; exit 4; }
-
-    log_info "File count for $pkg: $count"
-    printf '%s\n' "$count"
-  )
-  local rc=$?
-  trap - RETURN
-  rm -rf "$tmpdir"
-  return "$rc"
+  local count
+  count=$(dpkg-deb -c "${debs[0]}" | wc -l) || { echo "err"; return 4; }
+  echo "$count"
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -459,59 +537,77 @@ get_file_count() {
 ### Exits    : 0 success, 4 helper failure
 # ──────────────────────────────────────────────────────────────────────────────
 find_missing_slices() {
+  declare -A SEEN_DEPS=()
   local -a deps slices missing_pkgs
-  local missing_raw total fc
+  local dep_list missing_raw total fc
 
-  # 1) Gather unique deps for all requested packages
-  if ! mapfile -t deps < <(
-        for pkg in "${PACKAGES[@]}"; do
-          get_recursive_deps "$pkg" || exit 4
-        done | sort -u
-      ); then
-    log_err "Dependency resolution failed"; return 4
-  fi
+  mapfile -t deps < <(
+    for pkg in "${PACKAGES[@]}"; do
+      [[ -n ${SEEN_DEPS[$pkg]-} ]] && continue
+      dep_list=$(get_recursive_deps "$pkg") || exit 4
+      while read -r d; do
+        [[ -z ${SEEN_DEPS[$d]-} ]] && { SEEN_DEPS[$d]=1; printf '%s\n' "$d"; }
+      done <<<"$dep_list"
+    done | sort -u
+  ) || { log_err "dependency resolution failed"; return 4; }
 
-  # 2) Fetch slice catalogue (sorted in helper)
-  if ! mapfile -t slices < <(get_available_slices | sort -u); then
-    log_err "Slice catalogue fetch failed"; return 4
-  fi
+  mapfile -t slices < <(get_available_slices | sort -u) || {
+    log_err "slice catalogue fetch failed"; return 4; }
 
-  # 3) Diff deps-vs-slices (comm requires both inputs sorted)
   missing_raw=$(comm -23 \
       <(printf '%s\n' "${deps[@]}") \
       <(printf '%s\n' "${slices[@]}"))
 
-  # 4) Load into array
-  if [[ -n $missing_raw ]]; then
-    mapfile -t missing_pkgs <<<"$missing_raw"
-  fi
-
-  # 5) Summary log
+  [[ -n $missing_raw ]] && mapfile -t missing_pkgs <<<"$missing_raw"
   total=${#missing_pkgs[@]}
   log_info "Total missing packages: $total"
 
-  # 6) Detailed report
   if (( total == 0 )); then
-    log_info "✅ All dependencies have Chisel slices."
+    log_info "✅ All dependencies have Chisel slices"
   else
-    log_warn "🚧 Missing slices (${total}) – package : file_count"
+    log_warn "🚧  Missing slices (${total}) – package : file_count"
     for pkg in "${missing_pkgs[@]}"; do
       fc=$(get_file_count "$pkg") || fc="err"
       [[ $fc =~ ^[0-9]+$ ]] || fc="err"
       printf '  • %-22s : %5s files\n' "$pkg" "$fc"
     done
   fi
+}
+
+###############################################################################
+### main – top-level orchestrator
+### Phases
+###   • Environment sanity   (check_prereqs)
+###   • CLI parsing          (parse_args)
+###   • Package validation   (validate_packages)
+###   • Slice gap analysis   (find_missing_slices)
+### Globals : VERSION, SCRIPT_NAME, DRY_RUN, PACKAGES
+###############################################################################
+main() {
+  local start=$SECONDS
+  trap 'log_warn "Interrupted"; exit 130' INT TERM
+
+  log_info "${SCRIPT_NAME} ${VERSION} starting"
+
+  # CLI
+  parse_args "$@"      || return $?
+  log_info "Packages: ${PACKAGES[*]}  |  DRY_RUN=${DRY_RUN:-false}"
+
+  # Environment
+  check_prereqs        || return $?
+
+  # Sanity on resolved package names
+  validate_packages    || return $?
+
+  # Core analysis
+  find_missing_slices  || return $?
+
+  local runtime=$(( SECONDS - start ))
+  log_info "Run completed ✔ (elapsed ${runtime}s)"
   return 0
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# main: orchestrate
-# ──────────────────────────────────────────────────────────────────────────────
-main() {
-  parse_args "$@"
-  ensure_prereqs
-  validate_packages
-  find_missing_slices
-}
-
-main "$@"
+# ---- script entrypoint ------------------------------------------------------
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

@@ -120,57 +120,66 @@ log() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# parse_args "$@"
-#   Uses GNU getopt to handle -r|--release, -n|--dry-run, -v|--version, -h|--help
-#   Validates the release format (XX.XX) and ensures at least one package.
+# parse_args
+### Parse CLI options and positional parameters.
+### Globals set:
+###   RELEASE_OVERRIDE – Ubuntu version override (string or empty)
+###   DRY_RUN          – true/false
+###   PACKAGES         – array of package names
+### Exits:
+###   0  normal parsing
+###   1  usage error (no packages)
+###   2  getopt/format error
+###   3  GNU getopt missing.
 # ──────────────────────────────────────────────────────────────────────────────
 parse_args() {
-  # require GNU getopt
-  if ! command -v getopt &>/dev/null; then
-    log ERROR "GNU getopt is required for argument parsing."
-    exit 3
+  # Ensure GNU getopt exists (macOS users: `brew install gnu-getopt`)
+  if ! command -v getopt >/dev/null 2>&1; then
+    log_err "GNU getopt is required for argument parsing."
+    return 3
   fi
 
-  local opts
-  opts=$(getopt -o r:nvh -l release:,dry-run,version,help -n "$SCRIPT_NAME" -- "$@") \
-    || usage 2
-  eval set -- "$opts"
+  # shellcheck disable=SC2155
+  local _opts
+  if ! _opts=$(getopt -o r:nvh -l release:,dry-run,version,help -n "$SCRIPT_NAME" -- "$@"); then
+    usage 2; return 2
+  fi
+  eval set -- "$_opts"
 
+  local release_override='' dry_run=false
   while true; do
     case "$1" in
       -r|--release)
-        shift
-        RELEASE_OVERRIDE=$1
-        if [[ ! $RELEASE_OVERRIDE =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
-          log ERROR "Invalid release format: '$RELEASE_OVERRIDE' (expected XX.XX)"
-          usage 2
+        release_override=$2
+        # shellcheck disable=SC2076 # intentional regex
+        if [[ ! "$release_override" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+          log_err "Invalid release format: '$release_override' (expected XX.XX)"
+          usage 2; return 2
         fi
-        shift
-        ;;
-      -n|--dry-run)
-        DRY_RUN=true
-        shift
-        ;;
-      -v|--version)
-        echo "$SCRIPT_NAME version $VERSION"
-        exit 0
-        ;;
-      -h|--help)
-        usage 0
-        ;;
+        shift 2 ;;
+      -n|--dry-run) dry_run=true; shift ;;
+      -v|--version) printf '%s %s\n' "$SCRIPT_NAME" "${VERSION:-unknown}"; return 0 ;;
+      -h|--help)    usage 0; return 0 ;;
       --) shift; break ;;
-      *) usage 2 ;;
+      *)  usage 2; return 2 ;;
     esac
   done
 
   PACKAGES=("$@")
   if (( ${#PACKAGES[@]} == 0 )); then
-    log ERROR "No package names specified."
-    usage 1
+    log_err "No package names specified."
+    usage 1; return 1
   fi
 
-  log INFO "Settings: RELEASE_OVERRIDE='${RELEASE_OVERRIDE:-<auto>}', DRY_RUN=${DRY_RUN}, PACKAGES=(${PACKAGES[*]})"
+  # Promote validated locals to globals
+  RELEASE_OVERRIDE=$release_override
+  DRY_RUN=$dry_run
+
+  # Quote array for log
+  log_info "Settings: RELEASE='${RELEASE_OVERRIDE:-<auto>}' DRY_RUN=$DRY_RUN PACKAGES=${PACKAGES[*]}"
+  return 0
 }
+
 
 ###############################################################################
 ### check_prereqs
@@ -269,54 +278,105 @@ validate_packages() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# get_recursive_deps <package>
-#   Prints a sorted, unique list of all runtime deps for $1 (excluding itself).
+### get_recursive_deps
+### Return a sorted, unique list of APT dependencies (recursive) for a package.
+### Globals : none
+### Args    : $1 – package name (non-empty string)
+### Outputs : list of package names on stdout
+### Exits   : 0 success
+###           2 usage error (missing arg)
+###           3 missing apt-rdepends
+###           4 apt-rdepends failure or package not found
 # ──────────────────────────────────────────────────────────────────────────────
 get_recursive_deps() {
-  local pkg=$1
+  local -r pkg=$1
   if [[ -z $pkg ]]; then
-    log ERROR "Usage: get_recursive_deps <package>"
+    log_err "Usage: get_recursive_deps <package>"
     return 2
   fi
 
-  LC_ALL=C apt-rdepends "$pkg" 2>/dev/null \
-    | awk '/^[^[:space:]]/ { print $1 }' \
-    | tail -n +2 \
-    | sort -u
+  command -v apt-rdepends >/dev/null || { log_err "apt-rdepends not installed"; return 3; }
+
+  # Use LC_ALL=C for predictable English output; NR>1 drops the queried pkg itself
+  if ! LC_ALL=C apt-rdepends -- "$pkg" 2>/dev/null |
+        awk 'NR>1 && /^[^[:space:]]/ {print $1}' |
+        sort -u; then
+    log_err "Failed to resolve dependencies for '$pkg'"
+    return 4
+  fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# get_available_slices
-#   Fetches all *.yaml slice names (no extension) for the host/override Ubuntu.
+### get_available_slices
+### Fetch list of Ubuntu-Chisel slice names for a given release branch.
+### Globals read :
+###   RELEASE_OVERRIDE – optional XX.XX string
+###   GITHUB_TOKEN     – optional PAT to raise rate limit
+### Outputs :
+###   Slice names, one per line, on stdout
+### Exits :
+###   0 success
+###   2 invalid or undetectable release
+###   3 missing curl/jq
+###   4 HTTP error (non-200)
+###   5 zero slices returned
 # ──────────────────────────────────────────────────────────────────────────────
 get_available_slices() {
-  local version branch api_url raw names
+  local version branch etag_file api_url http raw
+  local -a names
 
-  if [[ -n $RELEASE_OVERRIDE ]]; then
+  # ---- determine release ----------------------------------------------------
+  if [[ -n ${RELEASE_OVERRIDE:-} ]]; then
     version=$RELEASE_OVERRIDE
   else
-    version=$(awk -F= '/^VERSION_ID/ { gsub(/"/,"",$2); print $2 }' /etc/os-release)
+    version=$(awk -F= '/^VERSION_ID/ {gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
   fi
-  branch="ubuntu-${version}"
-  log INFO "Fetching Chisel slices for branch ${branch}"
+  # shellcheck disable=SC2076
+  [[ $version =~ ^[0-9]{2}\.[0-9]{2}$ ]] || { log_err "Unknown Ubuntu release"; return 2; }
 
-  for tool in curl jq; do
-    command -v "$tool" &>/dev/null || { log ERROR "Missing $tool"; return 3; }
+  branch="ubuntu-${version}"
+  log_info "Fetching Chisel slices for branch ${branch}"
+
+  # ---- tool check -----------------------------------------------------------
+  for t in curl jq; do
+    command -v "$t" >/dev/null || { log_err "Missing $t"; return 3; }
   done
 
+  # ---- caching ETag to reduce API calls -------------------------------------
+  etag_file="${XDG_CACHE_HOME:-$HOME/.cache}/chisel_${branch}.etag"
+  [[ -d ${etag_file%/*} ]] || mkdir -p "${etag_file%/*}"
+
   api_url="https://api.github.com/repos/canonical/chisel-releases/contents/slices?ref=${branch}"
-  if ! raw=$(curl -fsSL "$api_url"); then
-    log ERROR "Failed to fetch slices from GitHub for ${branch}"
-    return 4
-  fi
+  local curl_args=( -fsSL -w "%{http_code}" )
+  [[ -f $etag_file ]] && curl_args+=( -H "If-None-Match: $(cat "$etag_file")" )
+  [[ -n ${GITHUB_TOKEN:-} ]] && curl_args+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+
+  # ---- request --------------------------------------------------------------
+  # shellcheck disable=SC2155
+  raw=$(curl "${curl_args[@]}" "$api_url") || { log_err "curl failed"; return 4; }
+  http=${raw: -3}       # last 3 chars from -w http_code
+  raw=${raw::-3}
+
+  case $http in
+    200)
+      printf '%s\n' "$(grep -Fi ETag -m1 < <(curl -I -s "$api_url") | awk '{print $2}')" >"$etag_file" 2>/dev/null || true
+      ;;
+    304) log_info "ETag match – using cached slice list"; raw=$(cat "$etag_file.cache");;
+    404) log_err "Branch ${branch} not found (404)"; return 4 ;;
+    403) log_err "GitHub API rate-limited (403). Set GITHUB_TOKEN."; return 4 ;;
+    *)   log_err "GitHub API returned HTTP $http"; return 4 ;;
+  esac
 
   mapfile -t names < <(
-    printf '%s\n' "$raw" \
-      | jq -r '.[] | select(.name|endswith(".yaml")) | .name' \
-      | sed 's/\.yaml$//' \
-      | sort -u
+    printf '%s\n' "$raw" |
+      jq -r '.[]|.name|select(endswith(".yaml"))|rtrimstr(".yaml")' |
+      sort -u
   )
+  ((${#names[@]})) || { log_err "No slices found for $branch"; return 5; }
+
   printf '%s\n' "${names[@]}"
+  log_info "Fetched ${#names[@]} slices for $branch"
+  return 0
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -324,121 +384,124 @@ get_available_slices() {
 #   Downloads the .deb for <package>, counts its file entries,
 #   then cleans up. Prints just the number.
 # ────────────────────────────────────────────────────────────────
+### get_file_count
+### Count files contained in a Debian package (or its provider).
+### Globals  : log_err log_warn log_info helpers
+### Args     : $1 – package name (string, required)
+### Outputs  : file count to stdout
+### Exits    : 0 success
+###            1 usage error
+###            2 non-Debian host or missing tools
+###            3 download failed & no provider
+###            4 corrupt deb or zero files
 get_file_count() {
-  local pkg=$1 tmpdir debs deb provider count
+  local -r pkg=$1
+  [[ -n $pkg ]] || { log_err "Usage: get_file_count <package>"; echo 0; return 1; }
 
-  # 1) Quick sanity
-  [[ -n $pkg ]] || { echo "0"; return 1; }
+  # Debian/Ubuntu-specific tools
+  for t in apt-get dpkg-deb; do
+    command -v "$t" >/dev/null || { log_err "$t not found"; echo 0; return 2; }
+  done
 
-  # 2) If apt-file is present use it (fastest)
-  if command -v apt-file &>/dev/null; then
-    count=$(apt-file list "$pkg" 2>/dev/null | wc -l)
-    echo "${count:-0}"
-    return
+  # Fast path: apt-file
+  if command -v apt-file >/dev/null 2>&1; then
+    local count
+    count=$(apt-file list "$pkg" 2>/dev/null | wc -l || true)
+    log_info "File count for $pkg via apt-file: $count"
+    printf '%s\n' "${count:-0}"
+    return 0
   fi
 
-  # 3) Try downloading the .deb
-  tmpdir=$(mktemp -d)
-  pushd "$tmpdir" >/dev/null
+  # Slow path: download .deb
+  umask 077
+  local tmpdir
+  tmpdir=$(mktemp -d) || { log_err "mktemp failed"; echo 0; return 2; }
 
-  if ! apt-get download "$pkg" &>/dev/null; then
-    log WARN "Could not download '$pkg'. Attempting to locate real provider…"
+  # Ensure cleanup even on error
+  trap 'rm -rf "$tmpdir"' RETURN
 
-    # 3a) Use apt-cache showpkg to find "Reverse Provides"
-    mapfile -t providers < <(apt-cache showpkg "$pkg" 2>/dev/null \
-      | awk '/Reverse Provides:/,/^$/' \
-      | tail -n +2 \
-      | awk '{print $1}')
+  (
+    cd "$tmpdir" || exit 1
 
-    if (( ${#providers[@]} )); then
-      provider=${providers[0]}
-      log INFO "Falling back to provider package: '$provider'"
-      pkg=$provider
-      # retry download
-      if ! apt-get download "$pkg" &>/dev/null; then
-        log ERROR "Download also failed for provider '$pkg'; skipping count."
-        popd >/dev/null; rm -rf "$tmpdir"
-        echo "0"
-        return
-      fi
-    else
-      log ERROR "No provider found for '$pkg'; skipping count."
-      popd >/dev/null; rm -rf "$tmpdir"
-      echo "0"
-      return
-    fi
-  fi
+    LC_ALL=C apt-get -qq download -- "$pkg" || {
+      log_warn "Download failed for '$pkg' – trying provider"
+      local provider
+      provider=$(apt-cache showpkg "$pkg" |
+                   awk '/Reverse Provides:/{f=1;next}f && NF{print $1; exit}')
+      [[ -n $provider ]] || { log_err "No provider for $pkg"; echo 0; exit 3; }
+      log_info "Falling back to provider '$provider'"
+      LC_ALL=C apt-get -qq download -- "$provider" || { echo 0; exit 3; }
+    }
 
-  # 4) Enable nullglob and collect .deb files
-  shopt -s nullglob
-  debs=( *.deb )
-  shopt -u nullglob
+    shopt -s nullglob
+    local debs=( *.deb )
+    shopt -u nullglob
+    (( ${#debs[@]} )) || { log_err "No .deb found for $pkg"; echo 0; exit 4; }
 
-  if (( ${#debs[@]} == 0 )); then
-    log ERROR "Downloaded .deb missing for '$pkg'; skipping count."
-    popd >/dev/null; rm -rf "$tmpdir"
-    echo "0"
-    return
-  fi
+    local count
+    count=$(dpkg-deb -c "${debs[0]}" | wc -l || true)
+    [[ $count =~ ^[0-9]+$ && $count -gt 0 ]] || { log_err "Corrupt deb for $pkg"; echo 0; exit 4; }
 
-  # 5) Count entries in the first .deb
-  count=$(dpkg-deb -c "${debs[0]}" | wc -l)
-
-  # 6) Cleanup and output
-  popd >/dev/null
+    log_info "File count for $pkg: $count"
+    printf '%s\n' "$count"
+  )
+  local rc=$?
+  trap - RETURN
   rm -rf "$tmpdir"
-  echo "$count"
+  return "$rc"
 }
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# find_missing_slices
-#   Diffs recursive deps vs. available slices, counts how many are missing,
-#   logs the total, and then lists each missing package along with its file count.
+### find_missing_slices
+### Determine which apt dependencies lack a corresponding Chisel slice.
+### Globals  : PACKAGES (array), log_* helpers
+### Outputs  : human-readable list and counts to stdout/stderr
+### Exits    : 0 success, 4 helper failure
 # ──────────────────────────────────────────────────────────────────────────────
 find_missing_slices() {
-  local deps slices missing_raw
-  declare -a missing_pkgs
+  local -a deps slices missing_pkgs
+  local missing_raw total fc
 
-  # 1) Gather deps
-  mapfile -t deps < <(
-    for pkg in "${PACKAGES[@]}"; do
-      get_recursive_deps "$pkg"
-    done | sort -u
-  )
+  # 1) Gather unique deps for all requested packages
+  if ! mapfile -t deps < <(
+        for pkg in "${PACKAGES[@]}"; do
+          get_recursive_deps "$pkg" || exit 4
+        done | sort -u
+      ); then
+    log_err "Dependency resolution failed"; return 4
+  fi
 
-  # 2) Gather slices
-  mapfile -t slices < <(get_available_slices | sort -u)
+  # 2) Fetch slice catalogue (sorted in helper)
+  if ! mapfile -t slices < <(get_available_slices | sort -u); then
+    log_err "Slice catalogue fetch failed"; return 4
+  fi
 
-  # 3) Initial diff
+  # 3) Diff deps-vs-slices (comm requires both inputs sorted)
   missing_raw=$(comm -23 \
-    <(printf '%s\n' "${deps[@]}") \
-    <(printf '%s\n' "${slices[@]}")
-  )
+      <(printf '%s\n' "${deps[@]}") \
+      <(printf '%s\n' "${slices[@]}"))
 
   # 4) Load into array
   if [[ -n $missing_raw ]]; then
     mapfile -t missing_pkgs <<<"$missing_raw"
-  else
-    missing_pkgs=()
   fi
 
-  # 5) Count & log
-  local total=${#missing_pkgs[@]}
-  log INFO "Total missing packages: ${total}"
+  # 5) Summary log
+  total=${#missing_pkgs[@]}
+  log_info "Total missing packages: $total"
 
-  # 6) Report with file counts
+  # 6) Detailed report
   if (( total == 0 )); then
-    log INFO "✅ No missing Chisel slices."
+    log_info "✅ All dependencies have Chisel slices."
   else
-    log WARN "🚧 Missing slices for these ${total} packages (package: file_count):"
+    log_warn "🚧 Missing slices (${total}) – package : file_count"
     for pkg in "${missing_pkgs[@]}"; do
-      # get file count for each missing package
-      local fc
-      fc=$(get_file_count "$pkg")
-      printf "  • %-20s : %4s files\n" "$pkg" "$fc"
+      fc=$(get_file_count "$pkg") || fc="err"
+      [[ $fc =~ ^[0-9]+$ ]] || fc="err"
+      printf '  • %-22s : %5s files\n' "$pkg" "$fc"
     done
   fi
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

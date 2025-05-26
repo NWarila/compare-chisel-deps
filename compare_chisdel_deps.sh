@@ -20,12 +20,31 @@ declare -a PACKAGES=()     # populated by parse_args()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # usage [exit_code]
-#   Show help & examples, then exit with the given code.
+### Print command synopsis, options and examples.
+### Globals:
+###   SCRIPT_NAME – script basename (set here if unset)
+###   VERSION     – semantic version (optional)
+### Arguments:
+###   $1 (optional) – numeric exit code (default 0 for help)
+### Outputs:
+###   Help text (stdout)
+### Exits:
+###   Provided exit code, or returns when sourced.
 # ──────────────────────────────────────────────────────────────────────────────
 usage() {
-  local exit_code="${1:-1}"
-  cat <<EOF
-Usage: $SCRIPT_NAME [OPTIONS] <package> [<package>...]
+  local exit_code=${1:-0}
+
+  # fallback script name
+  : "${SCRIPT_NAME:=${0##*/}}"
+
+  # ensure numeric exit code
+  [[ $exit_code =~ ^[0-9]+$ ]] || exit_code=1
+
+  # shellcheck disable=SC2155
+  local vmsg=${VERSION:+ Version ${VERSION}}
+
+  printf '%s\n' \
+"Usage: ${SCRIPT_NAME} [OPTIONS] <package> [<package>...]
 Compare an application's apt dependencies against Ubuntu Chiseled slices.
 
 Options:
@@ -36,12 +55,13 @@ Options:
   -h, --help              Show this help text and exit.
 
 Examples:
-  $SCRIPT_NAME wordpress
-  $SCRIPT_NAME -r 25.04 wordpress php-fpm mariadb-server
-  $SCRIPT_NAME --dry-run wordpress
+  \"${SCRIPT_NAME}\" wordpress
+  \"${SCRIPT_NAME}\" -r 25.04 wordpress php-fpm mariadb-server
+  \"${SCRIPT_NAME}\" --dry-run wordpress
 
-EOF
-  exit "$exit_code"
+${vmsg}"
+  # return when sourced, otherwise exit
+  return "$exit_code" 2>/dev/null || exit "$exit_code"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

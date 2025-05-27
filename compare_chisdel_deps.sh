@@ -501,8 +501,7 @@ get_file_count() {
 
   if ! _get_deb "$pkg" 2>"$tmpdir/apt_err"; then
     if grep -q "no candidate" "$tmpdir/apt_err"; then
-      log_warn "'$pkg' is virtual – count set to 0"
-      echo "0"; return 0
+      echo "0 Virtual Package"; return 0
     fi
     mapfile -t providers < <(apt-cache showpkg "$pkg" |
       awk '/Reverse Provides:/,/^$/' | tail -n +2 | awk '{print $1}')
@@ -529,49 +528,66 @@ get_file_count() {
   return 0
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
+###############################################################################
 ### find_missing_slices
-### Determine which apt dependencies lack a corresponding Chisel slice.
-### Globals  : PACKAGES (array), log_* helpers
-### Outputs  : human-readable list and counts to stdout/stderr
-### Exits    : 0 success, 4 helper failure
-# ──────────────────────────────────────────────────────────────────────────────
+### Compare the full dependency set of $PACKAGES against available Chisel
+### slices and report any gaps with file counts.
+### • For real binary packages: prints “NNNN files”.
+### • For virtual packages      : prints “0 Virtual Package” (no warning).
+### Globals: PACKAGES
+### Exits 0 always (pure reporting); relies on helpers:
+###   get_recursive_deps  – resolve deps via apt-rdepends
+###   get_available_slices – fetch slice names from Canonical repo
+###   get_file_count      – count files or detect “Virtual Package”
+###############################################################################
 find_missing_slices() {
-  declare -A SEEN_DEPS=()
-  local -a deps slices missing_pkgs
-  local dep_list missing_raw total fc
+  local deps slices missing_raw
+  declare -a missing_pkgs
 
+  # 1. Gather unique dependency list -----------------------------------------
   mapfile -t deps < <(
     for pkg in "${PACKAGES[@]}"; do
-      [[ -n ${SEEN_DEPS[$pkg]-} ]] && continue
-      dep_list=$(get_recursive_deps "$pkg") || exit 4
-      while read -r d; do
-        [[ -z ${SEEN_DEPS[$d]-} ]] && { SEEN_DEPS[$d]=1; printf '%s\n' "$d"; }
-      done <<<"$dep_list"
+      get_recursive_deps "$pkg"
     done | sort -u
-  ) || { log_err "dependency resolution failed"; return 4; }
+  )
 
-  mapfile -t slices < <(get_available_slices | sort -u) || {
-    log_err "slice catalogue fetch failed"; return 4; }
+  # 2. Fetch slice names ------------------------------------------------------
+  mapfile -t slices < <(get_available_slices | sort -u)
 
+  # 3. Diff: deps – slices ----------------------------------------------------
   missing_raw=$(comm -23 \
       <(printf '%s\n' "${deps[@]}") \
       <(printf '%s\n' "${slices[@]}"))
 
-  [[ -n $missing_raw ]] && mapfile -t missing_pkgs <<<"$missing_raw"
-  total=${#missing_pkgs[@]}
-  log_info "Total missing packages: $total"
+  # 4. Load into array
+  if [[ -n $missing_raw ]]; then
+    mapfile -t missing_pkgs <<<"$missing_raw"
+  else
+    missing_pkgs=()
+  fi
+
+  # 5. Report -----------------------------------------------------------------
+  local total=${#missing_pkgs[@]}
+  log_info "Total missing packages: ${total}"
 
   if (( total == 0 )); then
-    log_info "✅ All dependencies have Chisel slices"
-  else
-    log_warn "🚧  Missing slices (${total}) – package : file_count"
-    for pkg in "${missing_pkgs[@]}"; do
-      fc=$(get_file_count "$pkg") || fc="err"
-      [[ $fc =~ ^[0-9]+$ ]] || fc="err"
-      printf '  • %-22s : %5s files\n' "$pkg" "$fc"
-    done
+    log_info "✅  All dependencies have matching Chisel slices."
+    return 0
   fi
+
+  log_warn "🚧  Missing slices (${total}) – package : file_count"
+  local pkg fc
+  for pkg in "${missing_pkgs[@]}"; do
+    fc=$(get_file_count "$pkg")
+    if [[ $fc == *"Virtual Package"* ]]; then
+      printf "  • %-24s : %s\n" "$pkg" "$fc"
+    elif [[ $fc =~ ^[0-9]+$ ]]; then
+      printf "  • %-24s : %4s files\n" "$pkg" "$fc"
+    else
+      printf "  • %-24s :   err files\n" "$pkg"
+    fi
+  done
+  return 0
 }
 
 ###############################################################################
